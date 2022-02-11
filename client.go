@@ -10,7 +10,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -125,6 +127,34 @@ func NewMergeClient(ctx context.Context, addr string, namespace string, outs []i
 	}
 
 }
+
+
+func NewMergeClient_Multi(ctx context.Context, addrs []string, namespace string, outs []interface{}, requestHeaders []http.Header, opts ...Option) (ClientCloser, error) {
+	config := defaultConfig()
+	for _, o := range opts {
+		o(&config)
+	}
+
+	var u *url.URL
+	for _,v := range addrs{
+		_u, err := url.Parse(v)
+		if err != nil {
+			return nil, xerrors.Errorf("parsing address: %w", err)
+		}
+		u = _u
+	}
+
+	switch u.Scheme {
+	case "ws", "wss":
+		return websocketClient_Multi(ctx, addrs, namespace, outs, requestHeaders, config)
+	case "http", "https":
+		return httpClient(ctx, addrs[0], namespace, outs, requestHeaders[0], config)
+	default:
+		return nil, xerrors.Errorf("unknown url scheme '%s'", u.Scheme)
+	}
+
+}
+
 
 func httpClient(ctx context.Context, addr string, namespace string, outs []interface{}, requestHeader http.Header, config Config) (ClientCloser, error) {
 	c := client{
@@ -280,6 +310,126 @@ func websocketClient(ctx context.Context, addr string, namespace string, outs []
 		<-exiting
 	}, nil
 }
+
+
+func websocketClient_Multi(ctx context.Context, addrs []string, namespace string, outs []interface{}, requestHeaders []http.Header, config Config) (ClientCloser, error) {
+	var connFactories  []func() (*websocket.Conn, error)
+	for k,_ :=range addrs{
+		addr := addrs[k]
+		requestHeader := requestHeaders[k]
+		connFactory := func() (*websocket.Conn, error) {
+			conn, _, err := websocket.DefaultDialer.Dial(addr,requestHeader)
+			return conn, err
+		}
+		connFactories = append(connFactories,connFactory)
+	}
+
+	if config.proxyConnFactory != nil {
+		// used in tests
+		//connFactory = config.proxyConnFactory(connFactory)  //取消配置
+	}
+
+	currentFactoryIndex := 0
+	env, ok1 := os.LookupEnv("DAEMONINDEX")
+	if ok1 {
+		index,err := strconv.Atoi(env)
+		if err !=nil{
+			log.Errorf("websocketClientDaemon error", "DAEMONINDEX env err", err)
+		}else{
+			if index >= len(connFactories) {
+				log.Errorf("websocketClientDaemon error", "DAEMONINDEX illegal")
+			}else{
+				currentFactoryIndex = index
+			}
+		}
+	}
+
+	conn, err := connFactories[currentFactoryIndex]()  //默认连接第0个或者环境变量里面指定的
+	if err != nil {
+		return nil, err
+	}
+
+	if config.noReconnect {
+		connFactories = nil
+	}
+
+	c := client{
+		namespace:     namespace,
+		paramEncoders: config.paramEncoders,
+	}
+
+	requests := make(chan clientRequest)
+
+	c.doRequest = func(ctx context.Context, cr clientRequest) (clientResponse, error) {
+		select {
+		case requests <- cr:
+		case <-c.exiting:
+			return clientResponse{}, fmt.Errorf("websocket routine exitingaaa")
+		}
+
+		var ctxDone <-chan struct{}
+		var resp clientResponse
+
+		if ctx != nil {
+			ctxDone = ctx.Done()
+		}
+
+		// wait for response, handle context cancellation
+	loop:
+		for {
+			select {
+			case resp = <-cr.ready:
+				break loop
+			case <-ctxDone: // send cancel request
+				ctxDone = nil
+
+				cancelReq := clientRequest{
+					req: request{
+						Jsonrpc: "2.0",
+						Method:  wsCancel,
+						Params:  []param{{v: reflect.ValueOf(*cr.req.ID)}},
+					},
+				}
+				select {
+				case requests <- cancelReq:
+				case <-c.exiting:
+					log.Warn("failed to send request cancellation, websocket routing exited")
+				}
+
+			}
+		}
+
+		return resp, nil
+	}
+
+	stop := make(chan struct{})
+	exiting := make(chan struct{})
+	c.exiting = exiting
+
+	go (&wsConnMulti{
+		conn:             conn,
+		connFactories:     connFactories,
+		currentFactoryIndex: currentFactoryIndex,
+		reconnectBackoff: config.reconnectBackoff,
+		pingInterval:     config.pingInterval,
+		timeout:          config.timeout,
+		handler:          nil,
+		requests:         requests,
+		stop:             stop,
+		exiting:          exiting,
+	}).handleWsConn(ctx)
+
+	if err := c.provide(outs); err != nil {
+		return nil, err
+	}
+
+	return func() {
+		close(stop)
+		<-exiting
+	}, nil
+}
+
+
 
 func (c *client) provide(outs []interface{}) error {
 	for _, handler := range outs {
